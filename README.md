@@ -13,7 +13,8 @@ A Linux GUI autoclicker built with [egui](https://github.com/emilk/egui) and [ev
 
 ## Requirements
 
-- Linux with `uinput` support
+- Linux (Wayland). X11 may work but is untested.
+- `uinput` support
 - Membership in the `input` group (for `/dev/input/event*` and `/dev/uinput` access)
 
 ```sh

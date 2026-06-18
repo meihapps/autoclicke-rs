@@ -718,15 +718,25 @@ fn main() -> eframe::Result<()> {
     let button = Arc::new(Mutex::new(ClickButton::Left));
     let hotkey: Arc<Mutex<Vec<Key>>> = Arc::new(Mutex::new(vec![Key::KEY_F8]));
 
+    let mut opts = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_title(APP_TITLE)
+            .with_inner_size([UI_WIDTH, 300.0]),
+        renderer: eframe::Renderer::Wgpu,
+        ..Default::default()
+    };
+    // On X11-only systems libwayland-client.so is absent and winit errors instead of
+    // falling back gracefully. Force X11 when no Wayland session is detected.
+    if std::env::var_os("WAYLAND_DISPLAY").map_or(true, |v| v.is_empty()) {
+        opts.event_loop_builder = Some(Box::new(|builder| {
+            use winit::platform::x11::EventLoopBuilderExtX11;
+            builder.with_x11();
+        }));
+    }
+
     eframe::run_native(
         APP_TITLE,
-        eframe::NativeOptions {
-            viewport: egui::ViewportBuilder::default()
-                .with_title(APP_TITLE)
-                .with_inner_size([UI_WIDTH, 300.0]),
-            renderer: eframe::Renderer::Wgpu,
-            ..Default::default()
-        },
+        opts,
         Box::new(|cc| {
             let ctx = cc.egui_ctx.clone();
             spawn_mouse_watchers(Arc::clone(&state), ctx.clone());
