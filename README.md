@@ -4,11 +4,11 @@ A Linux GUI autoclicker built with [egui](https://github.com/emilk/egui) and [ev
 
 ## Features
 
-- Click interval — set how fast to click (ms / s / min)
-- Button selector — left, right, or both
-- Clicking duration — auto-stop after a time limit or a click count
-- Still threshold — only click when the mouse hasn't moved for a set time
-- Global hotkey — capture any key combo to toggle clicking from anywhere
+- Click interval: set how fast to click (ms / s / min)
+- Button selector: left, right, or both
+- Clicking duration: auto-stop after a time limit or a click count
+- Still threshold: only click when the mouse hasn't moved for a set time
+- Global hotkey: capture any key combo to toggle clicking from anywhere
 - Manual start/stop button in the UI
 
 ## Requirements
