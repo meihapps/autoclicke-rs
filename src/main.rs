@@ -168,9 +168,8 @@ impl Unit {
     fn range(self) -> RangeInclusive<f64> {
         match self {
             Self::Cps => 0.01..=1000.0,
-            Self::Ms => 1.0..=999_999.0,
+            Self::Ms | Self::Clicks => 1.0..=999_999.0,
             Self::Sec | Self::Min => 0.001..=999_999.0,
-            Self::Clicks => 1.0..=999_999.0,
         }
     }
 
@@ -182,13 +181,13 @@ impl Unit {
         }
     }
 
-    fn from_millis(self, ms: f64) -> f64 {
+    /// Converts a span in milliseconds into a value in this unit.
+    fn value_for_millis(self, ms: f64) -> f64 {
         match self {
             Self::Cps => 1000.0 / ms.max(1e-9),
-            Self::Ms => ms,
+            Self::Ms | Self::Clicks => ms,
             Self::Sec => ms / 1_000.0,
             Self::Min => ms / 60_000.0,
-            Self::Clicks => ms,
         }
     }
 }
@@ -222,7 +221,7 @@ impl Setting {
     /// Switch units, converting the value so the same rate/duration is kept.
     fn change_unit(&mut self, unit: Unit) {
         if self.unit.is_time() && unit.is_time() {
-            self.value = unit.from_millis(self.millis());
+            self.value = unit.value_for_millis(self.millis());
         }
         self.unit = unit;
         self.clamp();
@@ -465,7 +464,9 @@ impl Rng {
     fn seeded() -> Self {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map_or(0x9E37_79B9_7F4A_7C15, |d| d.as_nanos() as u64);
+            .map_or(0x9E37_79B9_7F4A_7C15, |d| {
+                u64::from(d.subsec_nanos()) ^ d.as_secs().rotate_left(30)
+            });
         Self(nanos | 1)
     }
 
@@ -476,7 +477,8 @@ impl Rng {
         x ^= x >> 7;
         x ^= x << 17;
         self.0 = x;
-        (x >> 11) as f64 / (1u64 << 53) as f64
+        // Put 52 random bits in the mantissa of a float in [1, 2), then shift down.
+        f64::from_bits(0x3FF0_0000_0000_0000 | (x >> 12)) - 1.0
     }
 
     /// A multiplier in [1 - fraction, 1 + fraction].
@@ -496,9 +498,9 @@ fn precise_sleep_until(deadline: Instant) {
         if now >= deadline {
             return;
         }
-        let remaining = deadline - now;
+        let remaining = deadline.saturating_duration_since(now);
         if remaining > SPIN_WINDOW {
-            thread::sleep(remaining - SPIN_WINDOW);
+            thread::sleep(remaining.saturating_sub(SPIN_WINDOW));
         } else {
             thread::yield_now();
         }
@@ -516,7 +518,7 @@ fn wait_while_clicking(state: &SharedState, deadline: Instant) -> bool {
         if now >= deadline {
             return true;
         }
-        if deadline - now > CHUNK + SPIN_WINDOW {
+        if deadline.saturating_duration_since(now) > CHUNK + SPIN_WINDOW {
             thread::sleep(CHUNK);
         } else {
             precise_sleep_until(deadline);
@@ -554,16 +556,14 @@ fn classify(dev: &Device) -> Option<DeviceKind> {
     let keys = dev.supported_keys();
     let rel = dev
         .supported_relative_axes()
-        .map_or(false, |axes| axes.contains(RelativeAxisType::REL_X));
+        .is_some_and(|axes| axes.contains(RelativeAxisType::REL_X));
     // Accelerometers also report ABS_X, so only count devices that look like a
     // touchpad or pen.
     let abs = dev
         .supported_absolute_axes()
-        .map_or(false, |axes| axes.contains(AbsoluteAxisType::ABS_X))
-        && keys.map_or(false, |k| {
-            k.contains(Key::BTN_TOOL_FINGER) || k.contains(Key::BTN_TOOL_PEN)
-        });
-    let hotkeys = keys.map_or(false, |k| k.iter().any(hotkey_eligible));
+        .is_some_and(|axes| axes.contains(AbsoluteAxisType::ABS_X))
+        && keys.is_some_and(|k| k.contains(Key::BTN_TOOL_FINGER) || k.contains(Key::BTN_TOOL_PEN));
+    let hotkeys = keys.is_some_and(|k| k.iter().any(hotkey_eligible));
     if rel || abs || hotkeys {
         Some(DeviceKind { rel, abs, hotkeys })
     } else {
@@ -609,6 +609,10 @@ fn is_still_enough(threshold: &Setting, last_moved: &Mutex<Instant>) -> bool {
     required <= 0.0 || last_moved.lock().elapsed() >= ms(required)
 }
 
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "click counts stay far below 2^52, where f64 is exact"
+)]
 fn limit_reached(limit: &Setting, session_start: Instant, session_clicks: u64) -> bool {
     if !limit.enabled {
         return false;
@@ -656,7 +660,7 @@ fn on_key_down(k: Key, state: &SharedState, hotkey: &Mutex<Hotkey>, ctx: &egui::
     match hk.mode {
         HotkeyMode::Toggle => {
             let mut last = state.last_toggle.lock();
-            if last.map_or(true, |t| t.elapsed() >= HOTKEY_DEBOUNCE) {
+            if last.is_none_or(|t| t.elapsed() >= HOTKEY_DEBOUNCE) {
                 *last = Some(Instant::now());
                 state.clicking.fetch_xor(true, SeqCst);
             }
@@ -710,9 +714,9 @@ fn watch_device(
 ) {
     let mut held_here: HashSet<Key> = HashSet::new();
     while !state.shutdown.load(SeqCst) {
-        let events = match dev.fetch_events() {
-            Ok(events) => events,
-            Err(_) => break, // unplugged; the scanner will pick it up again if it returns
+        // An error means the device was unplugged; the scanner reopens it if it returns.
+        let Ok(events) = dev.fetch_events() else {
+            break;
         };
         for ev in events {
             match ev.kind() {
@@ -722,19 +726,15 @@ fn watch_device(
                 InputEventKind::AbsAxis(_) if kind.abs => {
                     *state.last_moved.lock() = Instant::now();
                 }
-                InputEventKind::Key(k) if kind.hotkeys && hotkey_eligible(k) => match ev.value() {
-                    1 => {
-                        if held_here.insert(k) {
-                            on_key_down(k, state, hotkey, ctx);
-                        }
+                InputEventKind::Key(k) if kind.hotkeys && hotkey_eligible(k) => {
+                    // value 1 = down, 0 = up, 2 = autorepeat (ignored). The set filters
+                    // out duplicate downs/ups for the same key on this device.
+                    match ev.value() {
+                        1 if held_here.insert(k) => on_key_down(k, state, hotkey, ctx),
+                        0 if held_here.remove(&k) => on_key_up(k, state, hotkey, ctx, true),
+                        _ => {}
                     }
-                    0 => {
-                        if held_here.remove(&k) {
-                            on_key_up(k, state, hotkey, ctx, true);
-                        }
-                    }
-                    _ => {} // autorepeat
-                },
+                }
                 _ => {}
             }
         }
@@ -758,7 +758,7 @@ fn spawn_device_scanner(state: Arc<SharedState>, hotkey: Arc<Mutex<Hotkey>>, ctx
                     let is_event = path
                         .file_name()
                         .and_then(|n| n.to_str())
-                        .map_or(false, |n| n.starts_with("event"));
+                        .is_some_and(|n| n.starts_with("event"));
                     if !is_event || active.lock().contains(&path) {
                         continue;
                     }
@@ -1043,6 +1043,214 @@ fn hint(ui: &mut egui::Ui, text: impl Into<String>) {
     ui.label(egui::RichText::new(text.into()).small().weak());
 }
 
+/// Width of each of `n` equal segments filling the current row.
+#[expect(clippy::cast_precision_loss, reason = "only a handful of segments")]
+fn segment_width(ui: &egui::Ui, n: usize) -> f32 {
+    let n = n as f32;
+    let gap = ui.spacing().item_spacing.x;
+    (ui.available_width() - gap * (n - 1.0)) / n
+}
+
+fn section_break(ui: &mut egui::Ui) {
+    ui.add_space(6.0);
+    ui.separator();
+    ui.add_space(6.0);
+}
+
+impl App {
+    fn status_ui(&self, ui: &mut egui::Ui, clicking: bool) {
+        ui.heading(APP_TITLE);
+        ui.add_space(6.0);
+        if clicking {
+            let n = self.state.session_clicks.load(SeqCst);
+            ui.colored_label(
+                egui::Color32::from_rgb(100, 220, 100),
+                format!("● Active · {n} clicks"),
+            );
+        } else {
+            ui.colored_label(egui::Color32::from_rgb(160, 160, 160), "○ Stopped");
+        }
+    }
+
+    /// Button, rate and hold time. Returns whether the config changed.
+    fn click_settings_ui(&mut self, ui: &mut egui::Ui) -> bool {
+        let h = ui.spacing().interact_size.y;
+        let mut changed = false;
+
+        ui.label("Button");
+        ui.horizontal(|ui| {
+            let w = segment_width(ui, ClickButton::ALL.len());
+            for variant in ClickButton::ALL {
+                let selected = self.ui_cfg.button == variant;
+                if ui
+                    .add_sized(
+                        [w, h],
+                        egui::SelectableLabel::new(selected, variant.label()),
+                    )
+                    .clicked()
+                    && !selected
+                {
+                    self.ui_cfg.button = variant;
+                    changed = true;
+                }
+            }
+        });
+
+        ui.add_space(6.0);
+
+        ui.label("Click rate");
+        changed |= setting_field(ui, "rate", &mut self.ui_cfg.rate, RATE_UNITS);
+        let period = self.ui_cfg.period_ms();
+        if self.ui_cfg.rate.unit == Unit::Cps {
+            hint(ui, format!("one click every {period:.1} ms"));
+        } else {
+            hint(ui, format!("{:.2} clicks per second", 1000.0 / period));
+        }
+
+        ui.add_space(6.0);
+
+        ui.label("Hold each click for");
+        changed |= ui
+            .add_sized(
+                [ui.available_width(), h],
+                egui::DragValue::new(&mut self.ui_cfg.hold_ms)
+                    .clamp_range(0.0..=1000.0)
+                    .speed(0.25)
+                    .max_decimals(1)
+                    .suffix(" ms"),
+            )
+            .changed();
+        let effective = self.ui_cfg.hold_for(period);
+        if self.ui_cfg.hold_ms <= 0.0 {
+            hint(ui, "instant press and release — some games miss these");
+        } else if effective < self.ui_cfg.hold_ms {
+            hint(
+                ui,
+                format!("capped to {effective:.1} ms (half the interval)"),
+            );
+        }
+
+        changed
+    }
+
+    /// Randomized timing, auto-stop and still threshold. Returns whether the config changed.
+    fn extra_settings_ui(&mut self, ui: &mut egui::Ui) -> bool {
+        let mut changed = false;
+
+        changed |= ui
+            .checkbox(&mut self.ui_cfg.jitter_enabled, "Randomize timing")
+            .changed();
+        if self.ui_cfg.jitter_enabled {
+            changed |= ui
+                .add(egui::Slider::new(&mut self.ui_cfg.jitter_pct, 1.0..=50.0).suffix("%"))
+                .changed();
+            hint(ui, "each interval varies by up to ± this much");
+        }
+
+        ui.add_space(6.0);
+
+        changed |= ui
+            .checkbox(&mut self.ui_cfg.limit.enabled, "Stop after")
+            .changed();
+        if self.ui_cfg.limit.enabled {
+            changed |= setting_field(ui, "limit", &mut self.ui_cfg.limit, LIMIT_UNITS);
+        }
+
+        ui.add_space(6.0);
+
+        changed |= ui
+            .checkbox(
+                &mut self.ui_cfg.still.enabled,
+                "Only click when mouse is still for",
+            )
+            .changed();
+        if self.ui_cfg.still.enabled {
+            changed |= setting_field(ui, "still", &mut self.ui_cfg.still, TIME_UNITS);
+        }
+
+        changed
+    }
+
+    /// Hotkey capture and mode. Returns whether the hotkey settings changed.
+    fn hotkey_ui(&mut self, ui: &mut egui::Ui, capturing: bool) -> bool {
+        let h = ui.spacing().interact_size.y;
+        let mut changed = false;
+
+        ui.label("Hotkey (global)");
+        if self.state.scanned_once.load(SeqCst) && self.state.device_count.load(SeqCst) == 0 {
+            ui.colored_label(
+                egui::Color32::from_rgb(220, 200, 80),
+                "Can't read any input devices — are you in the 'input' group?",
+            );
+        }
+
+        let label = if capturing {
+            "Press key(s)… (Esc to cancel)".to_string()
+        } else {
+            format!("[{}]", self.hotkey_display)
+        };
+        if ui
+            .add_sized([ui.available_width(), h], egui::Button::new(label))
+            .clicked()
+        {
+            self.state.capturing.store(!capturing, SeqCst);
+        }
+
+        ui.horizontal(|ui| {
+            let w = segment_width(ui, 2);
+            let current = self.hotkey.lock().mode;
+            for (mode, label) in [
+                (HotkeyMode::Toggle, "Press to toggle"),
+                (HotkeyMode::Hold, "Hold to click"),
+            ] {
+                if ui
+                    .add_sized([w, h], egui::SelectableLabel::new(current == mode, label))
+                    .clicked()
+                    && current != mode
+                {
+                    self.hotkey.lock().mode = mode;
+                    changed = true;
+                }
+            }
+        });
+
+        changed
+    }
+
+    /// Start/stop button and any error messages.
+    fn controls_ui(&self, ui: &mut egui::Ui, clicking: bool) {
+        let h = ui.spacing().interact_size.y;
+        let toggle_label = if clicking { "Stop" } else { "Start" };
+        if ui
+            .add_sized(
+                [ui.available_width(), h * 1.5],
+                egui::Button::new(toggle_label),
+            )
+            .clicked()
+        {
+            if !clicking {
+                self.state.delayed_start.store(true, SeqCst);
+            }
+            // A compare-exchange so a concurrent stop (time limit reached, hotkey)
+            // isn't overwritten by a stale read.
+            let _ = self
+                .state
+                .clicking
+                .compare_exchange(clicking, !clicking, SeqCst, SeqCst);
+        }
+
+        let err = self.state.click_error.lock().clone();
+        if !err.is_empty() {
+            ui.add_space(4.0);
+            ui.colored_label(egui::Color32::from_rgb(220, 80, 80), &err);
+        }
+        if let Some(err) = &self.save_error {
+            ui.add_space(4.0);
+            ui.colored_label(egui::Color32::from_rgb(220, 80, 80), err);
+        }
+    }
+}
+
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let capturing = self.state.capturing.load(SeqCst);
@@ -1061,208 +1269,15 @@ impl eframe::App for App {
                 .auto_shrink([false; 2])
                 .show(ui, |ui| {
                     ui.vertical_centered(|ui| {
-                        let h = ui.spacing().interact_size.y;
-
-                        ui.heading(APP_TITLE);
+                        self.status_ui(ui, clicking);
+                        section_break(ui);
+                        changed |= self.click_settings_ui(ui);
                         ui.add_space(6.0);
-
-                        if clicking {
-                            let n = self.state.session_clicks.load(SeqCst);
-                            ui.colored_label(
-                                egui::Color32::from_rgb(100, 220, 100),
-                                format!("● Active · {n} clicks"),
-                            );
-                        } else {
-                            ui.colored_label(egui::Color32::from_rgb(160, 160, 160), "○ Stopped");
-                        }
-
-                        ui.add_space(6.0);
-                        ui.separator();
-                        ui.add_space(6.0);
-
-                        // Button selector — equal-width segments.
-                        ui.label("Button");
-                        ui.horizontal(|ui| {
-                            let n = ClickButton::ALL.len() as f32;
-                            let gap = ui.spacing().item_spacing.x;
-                            let w = (ui.available_width() - gap * (n - 1.0)) / n;
-                            for variant in ClickButton::ALL {
-                                let selected = self.ui_cfg.button == variant;
-                                if ui
-                                    .add_sized(
-                                        [w, h],
-                                        egui::SelectableLabel::new(selected, variant.label()),
-                                    )
-                                    .clicked()
-                                    && !selected
-                                {
-                                    self.ui_cfg.button = variant;
-                                    changed = true;
-                                }
-                            }
-                        });
-
-                        ui.add_space(6.0);
-
-                        // Click rate.
-                        ui.label("Click rate");
-                        changed |= setting_field(ui, "rate", &mut self.ui_cfg.rate, RATE_UNITS);
-                        let period = self.ui_cfg.period_ms();
-                        if self.ui_cfg.rate.unit == Unit::Cps {
-                            hint(ui, format!("one click every {period:.1} ms"));
-                        } else {
-                            hint(ui, format!("{:.2} clicks per second", 1000.0 / period));
-                        }
-
-                        ui.add_space(6.0);
-
-                        // Hold time.
-                        ui.label("Hold each click for");
-                        let r = ui.add_sized(
-                            [ui.available_width(), h],
-                            egui::DragValue::new(&mut self.ui_cfg.hold_ms)
-                                .clamp_range(0.0..=1000.0)
-                                .speed(0.25)
-                                .max_decimals(1)
-                                .suffix(" ms"),
-                        );
-                        changed |= r.changed();
-                        let effective = self.ui_cfg.hold_for(period);
-                        if self.ui_cfg.hold_ms <= 0.0 {
-                            hint(ui, "instant press and release — some games miss these");
-                        } else if effective < self.ui_cfg.hold_ms {
-                            hint(
-                                ui,
-                                format!("capped to {effective:.1} ms (half the interval)"),
-                            );
-                        }
-
-                        ui.add_space(6.0);
-
-                        // Randomized timing.
-                        changed |= ui
-                            .checkbox(&mut self.ui_cfg.jitter_enabled, "Randomize timing")
-                            .changed();
-                        if self.ui_cfg.jitter_enabled {
-                            changed |= ui
-                                .add(
-                                    egui::Slider::new(&mut self.ui_cfg.jitter_pct, 1.0..=50.0)
-                                        .suffix("%"),
-                                )
-                                .changed();
-                            hint(ui, "each interval varies by up to ± this much");
-                        }
-
-                        ui.add_space(6.0);
-
-                        // Auto-stop after a time or click count.
-                        changed |= ui
-                            .checkbox(&mut self.ui_cfg.limit.enabled, "Stop after")
-                            .changed();
-                        if self.ui_cfg.limit.enabled {
-                            changed |=
-                                setting_field(ui, "limit", &mut self.ui_cfg.limit, LIMIT_UNITS);
-                        }
-
-                        ui.add_space(6.0);
-
-                        // Still threshold.
-                        changed |= ui
-                            .checkbox(
-                                &mut self.ui_cfg.still.enabled,
-                                "Only click when mouse is still for",
-                            )
-                            .changed();
-                        if self.ui_cfg.still.enabled {
-                            changed |=
-                                setting_field(ui, "still", &mut self.ui_cfg.still, TIME_UNITS);
-                        }
-
-                        ui.add_space(6.0);
-                        ui.separator();
-                        ui.add_space(6.0);
-
-                        // Hotkey.
-                        ui.label("Hotkey (global)");
-                        if self.state.scanned_once.load(SeqCst)
-                            && self.state.device_count.load(SeqCst) == 0
-                        {
-                            ui.colored_label(
-                                egui::Color32::from_rgb(220, 200, 80),
-                                "Can't read any input devices — are you in the 'input' group?",
-                            );
-                        }
-                        if capturing {
-                            if ui
-                                .add_sized(
-                                    [ui.available_width(), h],
-                                    egui::Button::new("Press key(s)… (Esc to cancel)"),
-                                )
-                                .clicked()
-                            {
-                                self.state.capturing.store(false, SeqCst);
-                            }
-                        } else {
-                            let label = format!("[{}]", self.hotkey_display);
-                            if ui
-                                .add_sized([ui.available_width(), h], egui::Button::new(label))
-                                .clicked()
-                            {
-                                self.state.capturing.store(true, SeqCst);
-                            }
-                        }
-
-                        ui.horizontal(|ui| {
-                            let gap = ui.spacing().item_spacing.x;
-                            let w = (ui.available_width() - gap) / 2.0;
-                            let current = self.hotkey.lock().mode;
-                            for (mode, label) in [
-                                (HotkeyMode::Toggle, "Press to toggle"),
-                                (HotkeyMode::Hold, "Hold to click"),
-                            ] {
-                                if ui
-                                    .add_sized(
-                                        [w, h],
-                                        egui::SelectableLabel::new(current == mode, label),
-                                    )
-                                    .clicked()
-                                    && current != mode
-                                {
-                                    self.hotkey.lock().mode = mode;
-                                    hotkey_changed = true;
-                                }
-                            }
-                        });
-
+                        changed |= self.extra_settings_ui(ui);
+                        section_break(ui);
+                        hotkey_changed = self.hotkey_ui(ui, capturing);
                         ui.add_space(8.0);
-
-                        // Manual start/stop.
-                        let toggle_label = if clicking { "Stop" } else { "Start" };
-                        if ui
-                            .add_sized(
-                                [ui.available_width(), h * 1.5],
-                                egui::Button::new(toggle_label),
-                            )
-                            .clicked()
-                        {
-                            if !clicking {
-                                self.state.delayed_start.store(true, SeqCst);
-                            }
-                            let _ = self
-                                .state
-                                .clicking
-                                .compare_exchange(clicking, !clicking, SeqCst, SeqCst);
-                        }
-
-                        let err = self.state.click_error.lock().clone();
-                        if !err.is_empty() {
-                            ui.add_space(4.0);
-                            ui.colored_label(egui::Color32::from_rgb(220, 80, 80), &err);
-                        }
-                        if let Some(err) = &self.save_error {
-                            ui.add_space(4.0);
-                            ui.colored_label(egui::Color32::from_rgb(220, 80, 80), err);
-                        }
+                        self.controls_ui(ui, clicking);
                     });
                 });
         });
@@ -1294,10 +1309,55 @@ impl eframe::App for App {
     }
 }
 
+// ── Entry point ───────────────────────────────────────────────────────────────
+
+fn main() -> eframe::Result<()> {
+    let (config, hotkey) = load_config();
+    let state = SharedState::new();
+    let config = Arc::new(Mutex::new(config));
+    let hotkey = Arc::new(Mutex::new(hotkey));
+
+    let mut opts = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_title(APP_TITLE)
+            .with_inner_size([300.0, 560.0])
+            .with_min_inner_size([260.0, 300.0]),
+        renderer: eframe::Renderer::Wgpu,
+        ..Default::default()
+    };
+    // On X11-only systems libwayland-client.so is absent and winit errors instead of
+    // falling back gracefully. Force X11 when no Wayland session is detected.
+    if std::env::var_os("WAYLAND_DISPLAY").is_none_or(|v| v.is_empty()) {
+        opts.event_loop_builder = Some(Box::new(|builder| {
+            use winit::platform::x11::EventLoopBuilderExtX11;
+            builder.with_x11();
+        }));
+    }
+
+    eframe::run_native(
+        APP_TITLE,
+        opts,
+        Box::new(|cc| {
+            let ctx = cc.egui_ctx.clone();
+            spawn_device_scanner(Arc::clone(&state), Arc::clone(&hotkey), ctx.clone());
+            spawn_clicker(Arc::clone(&state), Arc::clone(&config), ctx);
+            Box::new(App::new(state, config, hotkey))
+        }),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use evdev::Key;
+
+    #[track_caller]
+    fn assert_close(actual: f64, expected: f64) {
+        assert!(
+            (actual - expected).abs() < 1e-9,
+            "expected {expected}, got {actual}"
+        );
+    }
 
     // key_name relies on evdev's Debug format ("KEY_*"). Pin it here so any
     // upstream change that would silently break labels is caught immediately.
@@ -1345,18 +1405,18 @@ mod tests {
     fn unit_change_keeps_rate() {
         let mut s = Setting::new(true, 20.0, Unit::Cps);
         s.change_unit(Unit::Ms);
-        assert!((s.value - 50.0).abs() < 1e-9);
+        assert_close(s.value, 50.0);
         s.change_unit(Unit::Sec);
-        assert!((s.value - 0.05).abs() < 1e-9);
+        assert_close(s.value, 0.05);
         s.change_unit(Unit::Cps);
-        assert!((s.value - 20.0).abs() < 1e-9);
+        assert_close(s.value, 20.0);
     }
 
     #[test]
     fn unit_change_to_clicks_keeps_value() {
         let mut s = Setting::new(true, 5.0, Unit::Min);
         s.change_unit(Unit::Clicks);
-        assert_eq!(s.value, 5.0);
+        assert_close(s.value, 5.0);
         assert_eq!(s.unit, Unit::Clicks);
     }
 
@@ -1366,8 +1426,8 @@ mod tests {
             hold_ms: 30.0,
             ..Config::default()
         };
-        assert_eq!(c.hold_for(100.0), 30.0);
-        assert_eq!(c.hold_for(20.0), 10.0);
+        assert_close(c.hold_for(100.0), 30.0);
+        assert_close(c.hold_for(20.0), 10.0);
     }
 
     #[test]
@@ -1377,7 +1437,7 @@ mod tests {
             let j = rng.jitter(0.2);
             assert!((0.8..=1.2).contains(&j));
         }
-        assert_eq!(rng.jitter(0.0), 1.0);
+        assert_close(rng.jitter(0.0), 1.0);
     }
 
     #[test]
@@ -1406,41 +1466,4 @@ mod tests {
         assert_eq!(c, Config::default());
         assert_eq!(h, Hotkey::default());
     }
-}
-
-// ── Entry point ───────────────────────────────────────────────────────────────
-
-fn main() -> eframe::Result<()> {
-    let (config, hotkey) = load_config();
-    let state = SharedState::new();
-    let config = Arc::new(Mutex::new(config));
-    let hotkey = Arc::new(Mutex::new(hotkey));
-
-    let mut opts = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title(APP_TITLE)
-            .with_inner_size([300.0, 560.0])
-            .with_min_inner_size([260.0, 300.0]),
-        renderer: eframe::Renderer::Wgpu,
-        ..Default::default()
-    };
-    // On X11-only systems libwayland-client.so is absent and winit errors instead of
-    // falling back gracefully. Force X11 when no Wayland session is detected.
-    if std::env::var_os("WAYLAND_DISPLAY").map_or(true, |v| v.is_empty()) {
-        opts.event_loop_builder = Some(Box::new(|builder| {
-            use winit::platform::x11::EventLoopBuilderExtX11;
-            builder.with_x11();
-        }));
-    }
-
-    eframe::run_native(
-        APP_TITLE,
-        opts,
-        Box::new(|cc| {
-            let ctx = cc.egui_ctx.clone();
-            spawn_device_scanner(Arc::clone(&state), Arc::clone(&hotkey), ctx.clone());
-            spawn_clicker(Arc::clone(&state), Arc::clone(&config), ctx);
-            Box::new(App::new(state, config, hotkey))
-        }),
-    )
 }
