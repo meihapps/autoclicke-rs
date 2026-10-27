@@ -1,5 +1,8 @@
 # autoclicke-rs
 
+> [!WARNING]
+> This project is vibeslop. It's mostly AI-generated and isn't indicative of the way I program at all.
+
 A Linux GUI autoclicker built with [egui](https://github.com/emilk/egui) and [evdev](https://github.com/emberian/evdev).
 
 ## Features
