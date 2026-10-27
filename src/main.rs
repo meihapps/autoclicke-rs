@@ -1,30 +1,47 @@
 use eframe::egui;
-use evdev::{AttributeSet, Device, EventType, InputEvent, InputEventKind, Key, RelativeAxisType};
-use evdev::uinput::VirtualDeviceBuilder;
+use evdev::uinput::{VirtualDevice, VirtualDeviceBuilder};
+use evdev::{
+    AbsoluteAxisType, AttributeSet, Device, EventType, InputEvent, InputEventKind, Key,
+    RelativeAxisType,
+};
 use parking_lot::Mutex;
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
+    io,
     ops::RangeInclusive,
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::SeqCst},
         Arc,
     },
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 const APP_TITLE: &str = "autoclicke-rs";
 const SYN_REPORT: u16 = 0; // evdev SynchronizationCode::SYN_REPORT
-const UI_WIDTH: f32 = 280.0;
-const DELAYED_START_MS: u64 = 300;
-const CLICKER_IDLE_SLEEP_MS: u64 = 10;
-const CLICKER_POLL_SLEEP_MS: u64 = 5;
-// Prevents multiple keyboard device threads from double-firing a single hotkey press.
-const HOTKEY_DEBOUNCE_MS: u64 = 200;
 
+// Pause after pressing the in-app Start button so the click on the button itself
+// isn't immediately followed by an autoclick on it.
+const DELAYED_START: Duration = Duration::from_millis(300);
+const IDLE_POLL: Duration = Duration::from_millis(5);
+// How often /dev/input is rescanned for newly plugged-in devices.
+const RESCAN_INTERVAL: Duration = Duration::from_secs(2);
+// Guards against one physical press toggling twice if a key shows up on two devices.
+const HOTKEY_DEBOUNCE: Duration = Duration::from_millis(150);
+// Settings are written to disk this long after the last change.
+const SAVE_DELAY: Duration = Duration::from_millis(500);
+// The last stretch before a deadline is spent yielding instead of sleeping, because
+// thread::sleep on Linux tends to overshoot by ~50-100µs.
+const SPIN_WINDOW: Duration = Duration::from_micros(300);
+// A click's hold time is capped at this fraction of the interval so there's always
+// a gap between release and the next press.
+const MAX_HOLD_FRACTION: f64 = 0.5;
+const MIN_PERIOD_MS: f64 = 1.0;
+
+const RATE_UNITS: &[Unit] = &[Unit::Cps, Unit::Ms, Unit::Sec, Unit::Min];
 const TIME_UNITS: &[Unit] = &[Unit::Ms, Unit::Sec, Unit::Min];
-const ALL_UNITS:  &[Unit] = &[Unit::Ms, Unit::Sec, Unit::Min, Unit::Clicks];
+const LIMIT_UNITS: &[Unit] = &[Unit::Ms, Unit::Sec, Unit::Min, Unit::Clicks];
 
 // ── Shared state between threads ─────────────────────────────────────────────
 
@@ -33,10 +50,14 @@ struct SharedState {
     shutdown: AtomicBool,
     capturing: AtomicBool,
     delayed_start: AtomicBool,
+    session_clicks: AtomicU64,
+    device_count: AtomicUsize,
+    scanned_once: AtomicBool,
     last_moved: Mutex<Instant>,
-    last_hotkey: Mutex<Option<Instant>>,
-    // Shared across all keyboard device threads so combos spanning multiple devices work.
-    held_keys: Mutex<HashSet<Key>>,
+    last_toggle: Mutex<Option<Instant>>,
+    // Keys currently held across all devices, with a count in case the same key is
+    // down on two devices at once. Shared so combos spanning devices work.
+    held_keys: Mutex<HashMap<Key, u32>>,
     click_error: Mutex<String>,
 }
 
@@ -47,9 +68,12 @@ impl SharedState {
             shutdown: AtomicBool::new(false),
             capturing: AtomicBool::new(false),
             delayed_start: AtomicBool::new(false),
+            session_clicks: AtomicU64::new(0),
+            device_count: AtomicUsize::new(0),
+            scanned_once: AtomicBool::new(false),
             last_moved: Mutex::new(Instant::now()),
-            last_hotkey: Mutex::new(None),
-            held_keys: Mutex::new(HashSet::new()),
+            last_toggle: Mutex::new(None),
+            held_keys: Mutex::new(HashMap::new()),
             click_error: Mutex::new(String::new()),
         })
     }
@@ -57,25 +81,52 @@ impl SharedState {
 
 // ── Config types ──────────────────────────────────────────────────────────────
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum ClickButton {
     Left,
+    Middle,
     Right,
     Both,
 }
 
 impl ClickButton {
+    const ALL: [ClickButton; 4] = [Self::Left, Self::Middle, Self::Right, Self::Both];
+
     fn label(self) -> &'static str {
         match self {
-            Self::Left  => "Left",
+            Self::Left => "Left",
+            Self::Middle => "Middle",
             Self::Right => "Right",
-            Self::Both  => "Both",
+            Self::Both => "L+R",
         }
+    }
+
+    fn keys(self) -> &'static [Key] {
+        match self {
+            Self::Left => &[Key::BTN_LEFT],
+            Self::Middle => &[Key::BTN_MIDDLE],
+            Self::Right => &[Key::BTN_RIGHT],
+            Self::Both => &[Key::BTN_LEFT, Key::BTN_RIGHT],
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Left => "left",
+            Self::Middle => "middle",
+            Self::Right => "right",
+            Self::Both => "both",
+        }
+    }
+
+    fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|b| b.as_str() == s)
     }
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum Unit {
+    Cps,
     Ms,
     Sec,
     Min,
@@ -83,245 +134,673 @@ enum Unit {
 }
 
 impl Unit {
+    const ALL: [Unit; 5] = [Self::Cps, Self::Ms, Self::Sec, Self::Min, Self::Clicks];
+
     fn label(self) -> &'static str {
         match self {
-            Self::Ms     => "ms",
-            Self::Sec    => "s",
-            Self::Min    => "min",
+            Self::Cps => "CPS",
+            Self::Ms => "ms",
+            Self::Sec => "s",
+            Self::Min => "min",
             Self::Clicks => "clicks",
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Cps => "cps",
+            Self::Ms => "ms",
+            Self::Sec => "s",
+            Self::Min => "min",
+            Self::Clicks => "clicks",
+        }
+    }
+
+    fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|u| u.as_str() == s)
+    }
+
+    /// Whether a value in this unit describes a span of time (CPS counts: it's a period).
+    fn is_time(self) -> bool {
+        self != Self::Clicks
+    }
+
+    fn range(self) -> RangeInclusive<f64> {
+        match self {
+            Self::Cps => 0.01..=1000.0,
+            Self::Ms => 1.0..=999_999.0,
+            Self::Sec | Self::Min => 0.001..=999_999.0,
+            Self::Clicks => 1.0..=999_999.0,
+        }
+    }
+
+    fn decimals(self) -> usize {
+        match self {
+            Self::Clicks => 0,
+            Self::Cps | Self::Ms => 2,
+            Self::Sec | Self::Min => 3,
+        }
+    }
+
+    fn from_millis(self, ms: f64) -> f64 {
+        match self {
+            Self::Cps => 1000.0 / ms.max(1e-9),
+            Self::Ms => ms,
+            Self::Sec => ms / 1_000.0,
+            Self::Min => ms / 60_000.0,
+            Self::Clicks => ms,
         }
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Debug)]
 struct Setting {
     enabled: bool,
-    value: u64,
+    value: f64,
     unit: Unit,
-    range: RangeInclusive<u64>,
 }
 
 impl Setting {
-    fn new(enabled: bool, value: u64, unit: Unit, range: RangeInclusive<u64>) -> Self {
-        Self { enabled, value, unit, range }
+    fn new(enabled: bool, value: f64, unit: Unit) -> Self {
+        Self {
+            enabled,
+            value,
+            unit,
+        }
     }
 
-    fn to_millis(&self) -> u64 {
+    fn millis(&self) -> f64 {
         match self.unit {
-            Unit::Ms     => self.value,
-            Unit::Sec    => self.value * 1_000,
-            Unit::Min    => self.value * 60_000,
-            Unit::Clicks => 0,
+            Unit::Cps => 1000.0 / self.value.max(1e-9),
+            Unit::Ms => self.value,
+            Unit::Sec => self.value * 1_000.0,
+            Unit::Min => self.value * 60_000.0,
+            Unit::Clicks => 0.0,
+        }
+    }
+
+    /// Switch units, converting the value so the same rate/duration is kept.
+    fn change_unit(&mut self, unit: Unit) {
+        if self.unit.is_time() && unit.is_time() {
+            self.value = unit.from_millis(self.millis());
+        }
+        self.unit = unit;
+        self.clamp();
+    }
+
+    fn clamp(&mut self) {
+        let range = self.unit.range();
+        if !self.value.is_finite() {
+            self.value = *range.start();
+        }
+        self.value = self.value.clamp(*range.start(), *range.end());
+    }
+}
+
+#[derive(Clone, PartialEq, Debug)]
+struct Config {
+    button: ClickButton,
+    rate: Setting,
+    hold_ms: f64,
+    jitter_enabled: bool,
+    jitter_pct: f64,
+    limit: Setting,
+    still: Setting,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            button: ClickButton::Left,
+            rate: Setting::new(true, 10.0, Unit::Cps),
+            hold_ms: 10.0,
+            jitter_enabled: false,
+            jitter_pct: 10.0,
+            limit: Setting::new(false, 1.0, Unit::Min),
+            still: Setting::new(false, 1.0, Unit::Sec),
+        }
+    }
+}
+
+impl Config {
+    fn period_ms(&self) -> f64 {
+        self.rate.millis().max(MIN_PERIOD_MS)
+    }
+
+    fn jitter_fraction(&self) -> f64 {
+        if self.jitter_enabled {
+            (self.jitter_pct / 100.0).clamp(0.0, 0.5)
+        } else {
+            0.0
+        }
+    }
+
+    /// How long to hold the button down for a click with the given period.
+    fn hold_for(&self, period_ms: f64) -> f64 {
+        self.hold_ms.min(period_ms * MAX_HOLD_FRACTION).max(0.0)
+    }
+
+    fn sanitize(&mut self) {
+        self.rate.clamp();
+        self.limit.clamp();
+        self.still.clamp();
+        if !self.hold_ms.is_finite() {
+            self.hold_ms = Config::default().hold_ms;
+        }
+        self.hold_ms = self.hold_ms.clamp(0.0, 1000.0);
+        if !self.jitter_pct.is_finite() {
+            self.jitter_pct = Config::default().jitter_pct;
+        }
+        self.jitter_pct = self.jitter_pct.clamp(1.0, 50.0);
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum HotkeyMode {
+    Toggle,
+    Hold,
+}
+
+#[derive(Clone, PartialEq, Debug)]
+struct Hotkey {
+    keys: Vec<Key>,
+    mode: HotkeyMode,
+}
+
+impl Default for Hotkey {
+    fn default() -> Self {
+        Self {
+            keys: vec![Key::KEY_F8],
+            mode: HotkeyMode::Toggle,
+        }
+    }
+}
+
+// ── Settings file ─────────────────────────────────────────────────────────────
+
+fn config_path() -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
+    Some(base.join(APP_TITLE).join("config"))
+}
+
+fn serialize_config(c: &Config, h: &Hotkey) -> String {
+    let flag = |b: bool| if b { "1" } else { "0" };
+    let codes: Vec<String> = h.keys.iter().map(|k| k.code().to_string()).collect();
+    let mode = match h.mode {
+        HotkeyMode::Toggle => "toggle",
+        HotkeyMode::Hold => "hold",
+    };
+    format!(
+        "button={}\n\
+         rate={}\nrate_unit={}\n\
+         hold_ms={}\n\
+         jitter_enabled={}\njitter_pct={}\n\
+         limit_enabled={}\nlimit={}\nlimit_unit={}\n\
+         still_enabled={}\nstill={}\nstill_unit={}\n\
+         hotkey={}\nhotkey_mode={}\n",
+        c.button.as_str(),
+        c.rate.value,
+        c.rate.unit.as_str(),
+        c.hold_ms,
+        flag(c.jitter_enabled),
+        c.jitter_pct,
+        flag(c.limit.enabled),
+        c.limit.value,
+        c.limit.unit.as_str(),
+        flag(c.still.enabled),
+        c.still.value,
+        c.still.unit.as_str(),
+        codes.join(","),
+        mode,
+    )
+}
+
+/// Parses the settings file. Unknown keys and bad values are ignored so an old or
+/// hand-edited file never stops the app from starting.
+fn parse_config(text: &str) -> (Config, Hotkey) {
+    let mut c = Config::default();
+    let mut h = Hotkey::default();
+    let num = |v: &str| v.parse::<f64>().ok().filter(|x| x.is_finite());
+    let flag = |v: &str| matches!(v, "1" | "true");
+
+    // Units are applied before values so the value isn't clamped to the old unit's range.
+    let lines: Vec<(&str, &str)> = text
+        .lines()
+        .filter_map(|l| l.split_once('='))
+        .map(|(k, v)| (k.trim(), v.trim()))
+        .collect();
+
+    for &(key, val) in &lines {
+        match key {
+            "rate_unit" => {
+                if let Some(u) = Unit::parse(val).filter(|u| RATE_UNITS.contains(u)) {
+                    c.rate.unit = u;
+                }
+            }
+            "limit_unit" => {
+                if let Some(u) = Unit::parse(val).filter(|u| LIMIT_UNITS.contains(u)) {
+                    c.limit.unit = u;
+                }
+            }
+            "still_unit" => {
+                if let Some(u) = Unit::parse(val).filter(|u| TIME_UNITS.contains(u)) {
+                    c.still.unit = u;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    for &(key, val) in &lines {
+        match key {
+            "button" => {
+                if let Some(b) = ClickButton::parse(val) {
+                    c.button = b;
+                }
+            }
+            "rate" => c.rate.value = num(val).unwrap_or(c.rate.value),
+            "hold_ms" => c.hold_ms = num(val).unwrap_or(c.hold_ms),
+            "jitter_enabled" => c.jitter_enabled = flag(val),
+            "jitter_pct" => c.jitter_pct = num(val).unwrap_or(c.jitter_pct),
+            "limit_enabled" => c.limit.enabled = flag(val),
+            "limit" => c.limit.value = num(val).unwrap_or(c.limit.value),
+            "still_enabled" => c.still.enabled = flag(val),
+            "still" => c.still.value = num(val).unwrap_or(c.still.value),
+            "hotkey" => {
+                let keys: Option<Vec<Key>> = val
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.parse::<u16>().ok().map(Key::new))
+                    .collect();
+                if let Some(keys) = keys {
+                    h.keys = keys;
+                }
+            }
+            "hotkey_mode" => {
+                h.mode = match val {
+                    "hold" => HotkeyMode::Hold,
+                    _ => HotkeyMode::Toggle,
+                }
+            }
+            _ => {}
+        }
+    }
+
+    c.sanitize();
+    (c, h)
+}
+
+fn load_config() -> (Config, Hotkey) {
+    match config_path().and_then(|p| std::fs::read_to_string(p).ok()) {
+        Some(text) => parse_config(&text),
+        None => (Config::default(), Hotkey::default()),
+    }
+}
+
+fn save_config(c: &Config, h: &Hotkey) -> io::Result<()> {
+    let path = config_path()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no HOME or XDG_CONFIG_HOME"))?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, serialize_config(c, h))?;
+    std::fs::rename(tmp, path)
+}
+
+// ── Timing helpers ────────────────────────────────────────────────────────────
+
+fn ms(v: f64) -> Duration {
+    Duration::from_secs_f64((v / 1000.0).max(0.0))
+}
+
+/// Small xorshift RNG; plenty for timing jitter and avoids an extra dependency.
+struct Rng(u64);
+
+impl Rng {
+    fn seeded() -> Self {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0x9E37_79B9_7F4A_7C15, |d| d.as_nanos() as u64);
+        Self(nanos | 1)
+    }
+
+    /// Uniform in [0, 1).
+    fn next_f64(&mut self) -> f64 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        (x >> 11) as f64 / (1u64 << 53) as f64
+    }
+
+    /// A multiplier in [1 - fraction, 1 + fraction].
+    fn jitter(&mut self, fraction: f64) -> f64 {
+        if fraction <= 0.0 {
+            return 1.0;
+        }
+        1.0 + fraction * (2.0 * self.next_f64() - 1.0)
+    }
+}
+
+/// Sleeps until `deadline` as precisely as practical: a normal sleep for most of
+/// the wait, then yielding for the last few hundred microseconds.
+fn precise_sleep_until(deadline: Instant) {
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return;
+        }
+        let remaining = deadline - now;
+        if remaining > SPIN_WINDOW {
+            thread::sleep(remaining - SPIN_WINDOW);
+        } else {
+            thread::yield_now();
+        }
+    }
+}
+
+/// Waits until `deadline`, returning `false` early if clicking gets switched off.
+fn wait_while_clicking(state: &SharedState, deadline: Instant) -> bool {
+    const CHUNK: Duration = Duration::from_millis(10);
+    loop {
+        if !state.clicking.load(SeqCst) || state.shutdown.load(SeqCst) {
+            return false;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return true;
+        }
+        if deadline - now > CHUNK + SPIN_WINDOW {
+            thread::sleep(CHUNK);
+        } else {
+            precise_sleep_until(deadline);
+            return state.clicking.load(SeqCst);
         }
     }
 }
 
 // ── evdev helpers ─────────────────────────────────────────────────────────────
 
-fn find_devices(filter: impl Fn(&Device) -> bool) -> Vec<PathBuf> {
-    let mut found = Vec::new();
-    let Ok(entries) = std::fs::read_dir("/dev/input") else {
-        return found;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if let Ok(dev) = Device::open(&path) {
-            if filter(&dev) {
-                found.push(path);
-            }
-        }
+/// Keys that can be part of the hotkey: keyboard keys plus the middle and side
+/// mouse buttons. Left/right click are excluded (you click the capture button with
+/// them), as are touchpad, tablet and gamepad buttons.
+fn hotkey_eligible(k: Key) -> bool {
+    let code = k.code();
+    // 0x112..=0x117 is BTN_MIDDLE through BTN_TASK (middle, side and extra buttons).
+    code < 0x100 || (0x112..=0x117).contains(&code) || code >= 0x160
+}
+
+#[derive(Clone, Copy)]
+struct DeviceKind {
+    /// Relative pointer (mouse, trackball, trackpoint).
+    rel: bool,
+    /// Absolute pointer we treat as mouse movement (touchpad, pen tablet).
+    abs: bool,
+    /// Has keys/buttons usable for the hotkey.
+    hotkeys: bool,
+}
+
+fn classify(dev: &Device) -> Option<DeviceKind> {
+    // Never listen to our own virtual clicker.
+    if dev.name() == Some(APP_TITLE) {
+        return None;
     }
-    found
-}
-
-fn find_mouse_devices() -> Vec<PathBuf> {
-    find_devices(|dev| {
-        dev.supported_events().contains(EventType::RELATIVE)
-            && dev.supported_relative_axes()
-                .map_or(false, |axes| axes.contains(RelativeAxisType::REL_X))
-    })
-}
-
-fn find_keyboard_devices() -> Vec<PathBuf> {
-    find_devices(|dev| {
-        dev.supported_events().contains(EventType::KEY)
-            && dev.supported_keys()
-                .map_or(false, |keys| keys.contains(Key::KEY_A))
-    })
+    let keys = dev.supported_keys();
+    let rel = dev
+        .supported_relative_axes()
+        .map_or(false, |axes| axes.contains(RelativeAxisType::REL_X));
+    // Accelerometers also report ABS_X, so only count devices that look like a
+    // touchpad or pen.
+    let abs = dev
+        .supported_absolute_axes()
+        .map_or(false, |axes| axes.contains(AbsoluteAxisType::ABS_X))
+        && keys.map_or(false, |k| {
+            k.contains(Key::BTN_TOOL_FINGER) || k.contains(Key::BTN_TOOL_PEN)
+        });
+    let hotkeys = keys.map_or(false, |k| k.iter().any(hotkey_eligible));
+    if rel || abs || hotkeys {
+        Some(DeviceKind { rel, abs, hotkeys })
+    } else {
+        None
+    }
 }
 
 // ── uinput helpers ───────────────────────────────────────────────────────────
 
-fn create_clicker_device() -> std::io::Result<evdev::uinput::VirtualDevice> {
+fn create_clicker_device() -> io::Result<VirtualDevice> {
     let mut keys = AttributeSet::<Key>::new();
-    keys.insert(Key::BTN_LEFT);
-    keys.insert(Key::BTN_RIGHT);
+    for k in [Key::BTN_LEFT, Key::BTN_RIGHT, Key::BTN_MIDDLE] {
+        keys.insert(k);
+    }
+    // We never move the pointer, but libinput only treats a device as a mouse if it
+    // has relative axes; without them some compositors ignore the clicks.
+    let mut axes = AttributeSet::<RelativeAxisType>::new();
+    axes.insert(RelativeAxisType::REL_X);
+    axes.insert(RelativeAxisType::REL_Y);
     VirtualDeviceBuilder::new()?
         .name(APP_TITLE)
         .with_keys(&keys)?
+        .with_relative_axes(&axes)?
         .build()
 }
 
-fn emit_click(device: &mut evdev::uinput::VirtualDevice, key: Key) -> std::io::Result<()> {
-    let press   = InputEvent::new(EventType::KEY,             key.code(), 1);
-    let syn     = InputEvent::new(EventType::SYNCHRONIZATION, SYN_REPORT, 0);
-    let release = InputEvent::new(EventType::KEY,             key.code(), 0);
-    device.emit(&[press, syn, release, syn])
+fn emit_buttons(device: &mut VirtualDevice, keys: &[Key], value: i32) -> io::Result<()> {
+    let mut events: Vec<InputEvent> = keys
+        .iter()
+        .map(|k| InputEvent::new(EventType::KEY, k.code(), value))
+        .collect();
+    events.push(InputEvent::new(EventType::SYNCHRONIZATION, SYN_REPORT, 0));
+    device.emit(&events)
 }
 
 // ── Clicker helpers ───────────────────────────────────────────────────────────
 
 fn is_still_enough(threshold: &Setting, last_moved: &Mutex<Instant>) -> bool {
-    if !threshold.enabled { return true; }
-    let required = threshold.to_millis();
-    required == 0 || last_moved.lock().elapsed() >= Duration::from_millis(required)
+    if !threshold.enabled {
+        return true;
+    }
+    let required = threshold.millis();
+    required <= 0.0 || last_moved.lock().elapsed() >= ms(required)
 }
 
-fn is_duration_over(setting: &Setting, session_start: Instant, session_clicks: u64) -> bool {
-    if !setting.enabled { return false; }
-    match setting.unit {
-        Unit::Clicks => setting.value > 0 && session_clicks >= setting.value,
-        _ => {
-            let total = setting.to_millis();
-            total > 0 && session_start.elapsed() >= Duration::from_millis(total)
-        }
+fn limit_reached(limit: &Setting, session_start: Instant, session_clicks: u64) -> bool {
+    if !limit.enabled {
+        return false;
+    }
+    match limit.unit {
+        Unit::Clicks => session_clicks as f64 >= limit.value,
+        _ => session_start.elapsed() >= ms(limit.millis()),
     }
 }
 
 // ── Background threads ────────────────────────────────────────────────────────
 
-fn spawn_mouse_watchers(state: Arc<SharedState>, ctx: egui::Context) {
-    for path in find_mouse_devices() {
-        let state = Arc::clone(&state);
-        let ctx   = ctx.clone();
-        thread::spawn(move || {
-            let Ok(mut dev) = Device::open(&path) else { return };
-            loop {
-                if state.shutdown.load(Ordering::Acquire) { break; }
-                match dev.fetch_events() {
-                    Ok(events) => {
-                        for ev in events {
-                            if matches!(ev.kind(), InputEventKind::RelAxis(_)) {
-                                *state.last_moved.lock() = Instant::now();
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        *state.click_error.lock() = format!("Mouse device lost: {e}");
-                        ctx.request_repaint();
-                        break;
-                    }
-                }
-            }
-        });
+fn release_held(held: &mut HashMap<Key, u32>, k: Key) {
+    if let Some(count) = held.get_mut(&k) {
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            held.remove(&k);
+        }
     }
 }
 
-// Returns the number of keyboard device threads spawned.
-fn spawn_hotkey_watcher(
-    state: Arc<SharedState>,
-    hotkey: Arc<Mutex<Vec<Key>>>,
-    ctx: egui::Context,
-) -> usize {
-    let paths = find_keyboard_devices();
-    let count = paths.len();
-    for path in paths {
-        let state  = Arc::clone(&state);
-        let hotkey = Arc::clone(&hotkey);
-        let ctx    = ctx.clone();
-        thread::spawn(move || {
-            let Ok(mut dev) = Device::open(&path) else { return };
-            loop {
-                if state.shutdown.load(Ordering::Acquire) { break; }
-                match dev.fetch_events() {
-                    Ok(events) => {
-                        for ev in events {
-                            let InputEventKind::Key(k) = ev.kind() else { continue };
-                            match ev.value() {
-                                1 => { // key down
-                                    // held_keys is shared across all keyboard threads so combos
-                                    // whose keys arrive on different devices are detected.
-                                    // Lock order: held_keys → hotkey → last_hotkey.
-                                    let mut held = state.held_keys.lock();
-                                    held.insert(k);
-                                    // Check `capturing` inside the hotkey lock to close the
-                                    // TOCTOU window where the GUI sets capturing=true between
-                                    // our load and the lock acquisition.
-                                    let hk = hotkey.lock();
-                                    if !state.capturing.load(Ordering::Relaxed)
-                                        && !hk.is_empty()
-                                        && held.len() == hk.len()
-                                        && hk.iter().all(|k| held.contains(k))
-                                    {
-                                        // Debounce: if two device threads both insert the last
-                                        // key of the combo within HOTKEY_DEBOUNCE_MS, only the
-                                        // first one fires.
-                                        let mut last = state.last_hotkey.lock();
-                                        let elapsed_ok = last.map_or(true, |t| {
-                                            t.elapsed().as_millis() as u64 >= HOTKEY_DEBOUNCE_MS
-                                        });
-                                        if elapsed_ok {
-                                            *last = Some(Instant::now());
-                                            drop(last);
-                                            drop(hk);
-                                            drop(held);
-                                            state.clicking.fetch_xor(true, Ordering::Relaxed);
-                                            ctx.request_repaint();
-                                        }
-                                    }
-                                }
-                                0 => { // key up — snapshot held (with k still in) for capture, then remove k
-                                    let snapshot: Vec<Key> = {
-                                        let mut held = state.held_keys.lock();
-                                        let snap = held.iter().copied().collect();
-                                        held.remove(&k);
-                                        snap
-                                    };
-                                    if state.capturing.load(Ordering::Relaxed) && !snapshot.is_empty() {
-                                        if state.capturing
-                                            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Relaxed)
-                                            .is_ok()
-                                        {
-                                            let mut combo = snapshot;
-                                            combo.sort_by_key(|k| key_order(*k));
-                                            *hotkey.lock() = combo;
-                                            ctx.request_repaint();
-                                        }
-                                    }
-                                }
-                                _ => {} // repeat, ignore
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        *state.click_error.lock() = format!("Keyboard device lost: {e}");
-                        ctx.request_repaint();
-                        break;
-                    }
-                }
-            }
-        });
+// Lock order everywhere: held_keys → hotkey → last_toggle.
+fn on_key_down(k: Key, state: &SharedState, hotkey: &Mutex<Hotkey>, ctx: &egui::Context) {
+    let mut held = state.held_keys.lock();
+    *held.entry(k).or_insert(0) += 1;
+
+    if state.capturing.load(SeqCst) {
+        if k == Key::KEY_ESC
+            && state
+                .capturing
+                .compare_exchange(true, false, SeqCst, SeqCst)
+                .is_ok()
+        {
+            ctx.request_repaint();
+        }
+        return;
     }
-    count
+
+    // Fire when the key just pressed completes the combo. Other held keys don't
+    // matter, so the hotkey still works while you're holding W or a mouse button.
+    let hk = hotkey.lock();
+    if !hk.keys.contains(&k) || !hk.keys.iter().all(|key| held.contains_key(key)) {
+        return;
+    }
+    match hk.mode {
+        HotkeyMode::Toggle => {
+            let mut last = state.last_toggle.lock();
+            if last.map_or(true, |t| t.elapsed() >= HOTKEY_DEBOUNCE) {
+                *last = Some(Instant::now());
+                state.clicking.fetch_xor(true, SeqCst);
+            }
+        }
+        HotkeyMode::Hold => state.clicking.store(true, SeqCst),
+    }
+    ctx.request_repaint();
 }
 
-fn spawn_clicker(
-    state: Arc<SharedState>,
-    interval: Arc<Mutex<Setting>>,
-    click_duration: Arc<Mutex<Setting>>,
-    still_threshold: Arc<Mutex<Setting>>,
-    button: Arc<Mutex<ClickButton>>,
-    ctx: egui::Context,
+fn on_key_up(
+    k: Key,
+    state: &SharedState,
+    hotkey: &Mutex<Hotkey>,
+    ctx: &egui::Context,
+    allow_capture: bool,
 ) {
+    let mut held = state.held_keys.lock();
+
+    // Capture finishes on the first release, taking everything held at that moment.
+    if allow_capture && state.capturing.load(SeqCst) {
+        let mut combo: Vec<Key> = held.keys().copied().collect();
+        if !combo.contains(&k) {
+            combo.push(k);
+        }
+        if state
+            .capturing
+            .compare_exchange(true, false, SeqCst, SeqCst)
+            .is_ok()
+        {
+            combo.sort_by_key(|k| key_order(*k));
+            hotkey.lock().keys = combo;
+            ctx.request_repaint();
+        }
+        release_held(&mut held, k);
+        return;
+    }
+
+    release_held(&mut held, k);
+    let hk = hotkey.lock();
+    if hk.mode == HotkeyMode::Hold && hk.keys.contains(&k) && state.clicking.swap(false, SeqCst) {
+        ctx.request_repaint();
+    }
+}
+
+fn watch_device(
+    mut dev: Device,
+    kind: DeviceKind,
+    state: &SharedState,
+    hotkey: &Mutex<Hotkey>,
+    ctx: &egui::Context,
+) {
+    let mut held_here: HashSet<Key> = HashSet::new();
+    while !state.shutdown.load(SeqCst) {
+        let events = match dev.fetch_events() {
+            Ok(events) => events,
+            Err(_) => break, // unplugged; the scanner will pick it up again if it returns
+        };
+        for ev in events {
+            match ev.kind() {
+                InputEventKind::RelAxis(_) if kind.rel => {
+                    *state.last_moved.lock() = Instant::now();
+                }
+                InputEventKind::AbsAxis(_) if kind.abs => {
+                    *state.last_moved.lock() = Instant::now();
+                }
+                InputEventKind::Key(k) if kind.hotkeys && hotkey_eligible(k) => match ev.value() {
+                    1 => {
+                        if held_here.insert(k) {
+                            on_key_down(k, state, hotkey, ctx);
+                        }
+                    }
+                    0 => {
+                        if held_here.remove(&k) {
+                            on_key_up(k, state, hotkey, ctx, true);
+                        }
+                    }
+                    _ => {} // autorepeat
+                },
+                _ => {}
+            }
+        }
+    }
+    // The device went away with keys down: release them so they can't complete a
+    // combo later, and stop a hold-mode session that was running on them.
+    for k in held_here {
+        on_key_up(k, state, hotkey, ctx, false);
+    }
+}
+
+/// Watches /dev/input and starts a listener for every mouse/keyboard, including
+/// ones plugged in (or woken from suspend) after startup.
+fn spawn_device_scanner(state: Arc<SharedState>, hotkey: Arc<Mutex<Hotkey>>, ctx: egui::Context) {
+    thread::spawn(move || {
+        let active: Arc<Mutex<HashSet<PathBuf>>> = Arc::default();
+        while !state.shutdown.load(SeqCst) {
+            if let Ok(entries) = std::fs::read_dir("/dev/input") {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    let is_event = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .map_or(false, |n| n.starts_with("event"));
+                    if !is_event || active.lock().contains(&path) {
+                        continue;
+                    }
+                    let Ok(dev) = Device::open(&path) else {
+                        continue;
+                    };
+                    let Some(kind) = classify(&dev) else { continue };
+
+                    active.lock().insert(path.clone());
+                    let state = Arc::clone(&state);
+                    let hotkey = Arc::clone(&hotkey);
+                    let ctx = ctx.clone();
+                    let active = Arc::clone(&active);
+                    thread::spawn(move || {
+                        watch_device(dev, kind, &state, &hotkey, &ctx);
+                        active.lock().remove(&path);
+                    });
+                }
+            }
+            let count = active.lock().len();
+            let changed = state.device_count.swap(count, SeqCst) != count;
+            let first = !state.scanned_once.swap(true, SeqCst);
+            if changed || first {
+                ctx.request_repaint();
+            }
+            thread::sleep(RESCAN_INTERVAL);
+        }
+    });
+}
+
+fn spawn_clicker(state: Arc<SharedState>, config: Arc<Mutex<Config>>, ctx: egui::Context) {
     thread::spawn(move || {
         let mut dev = match create_clicker_device() {
             Ok(d) => d,
             Err(e) => {
                 let hint = match e.kind() {
-                    std::io::ErrorKind::PermissionDenied =>
-                        "add yourself to the 'input' or 'uinput' group",
-                    std::io::ErrorKind::NotFound =>
-                        "the uinput module may not be loaded — try: modprobe uinput",
+                    io::ErrorKind::PermissionDenied => {
+                        "add yourself to the 'input' or 'uinput' group"
+                    }
+                    io::ErrorKind::NotFound => {
+                        "the uinput module may not be loaded — try: modprobe uinput"
+                    }
                     _ => "check /dev/uinput permissions",
                 };
                 *state.click_error.lock() = format!("Cannot open /dev/uinput: {e} — {hint}");
@@ -330,84 +809,93 @@ fn spawn_clicker(
             }
         };
 
-        let mut session_start: Option<Instant> = None;
-        let mut clicking_since: Option<Instant> = None;
-        let mut session_clicks: u64 = 0;
+        let mut rng = Rng::seeded();
+        let mut active = false;
+        let mut session_start = Instant::now();
+        let mut next_click = Instant::now();
 
         loop {
-            if state.shutdown.load(Ordering::Acquire) { break; }
+            if state.shutdown.load(SeqCst) {
+                break;
+            }
 
-            // Acquire pairs with the Release CAS in the GUI's Start/Stop button so that
-            // `delayed_start = true` is visible whenever `clicking = true` is.
-            if !state.clicking.load(Ordering::Acquire) {
-                session_start = None;
-                session_clicks = 0;
-                if clicking_since.take().is_some() {
-                    state.delayed_start.store(false, Ordering::Relaxed);
+            if !state.clicking.load(SeqCst) {
+                if active {
+                    active = false;
+                    state.delayed_start.store(false, SeqCst);
+                    ctx.request_repaint();
                 }
-                thread::sleep(Duration::from_millis(CLICKER_IDLE_SLEEP_MS));
+                thread::sleep(IDLE_POLL);
                 continue;
             }
 
-            if clicking_since.is_none() {
-                clicking_since = Some(Instant::now());
-                *state.last_moved.lock() = Instant::now();
+            if !active {
+                active = true;
+                session_start = Instant::now();
+                state.session_clicks.store(0, SeqCst);
+                *state.last_moved.lock() = session_start;
                 state.click_error.lock().clear();
-            }
-
-            if state.delayed_start.load(Ordering::Relaxed) {
-                if clicking_since.unwrap().elapsed() < Duration::from_millis(DELAYED_START_MS) {
-                    thread::sleep(Duration::from_millis(CLICKER_POLL_SLEEP_MS));
+                if state.delayed_start.swap(false, SeqCst)
+                    && !wait_while_clicking(&state, session_start + DELAYED_START)
+                {
                     continue;
                 }
-                state.delayed_start.store(false, Ordering::Relaxed);
+                next_click = Instant::now();
             }
 
-            if !is_still_enough(&still_threshold.lock(), &state.last_moved) {
-                session_start = None;
-                thread::sleep(Duration::from_millis(CLICKER_POLL_SLEEP_MS));
-                continue;
-            }
+            let cfg = config.lock().clone();
 
-            let now = Instant::now();
-            let session = session_start.get_or_insert(now);
-
-            if is_duration_over(&click_duration.lock(), *session, session_clicks) {
-                state.clicking.store(false, Ordering::Relaxed);
-                session_start = None;
+            if limit_reached(&cfg.limit, session_start, state.session_clicks.load(SeqCst)) {
+                state.clicking.store(false, SeqCst);
                 ctx.request_repaint();
                 continue;
             }
 
-            let btn = *button.lock();
-            let emit_err = match btn {
-                ClickButton::Left  => emit_click(&mut dev, Key::BTN_LEFT).err(),
-                ClickButton::Right => emit_click(&mut dev, Key::BTN_RIGHT).err(),
-                ClickButton::Both  => {
-                    let a = emit_click(&mut dev, Key::BTN_LEFT);
-                    let b = emit_click(&mut dev, Key::BTN_RIGHT);
-                    match (a, b) {
-                        (Err(e1), Err(e2)) => Some(std::io::Error::other(format!("{e1}; {e2}"))),
-                        (Err(e), _) | (_, Err(e)) => Some(e),
-                        _ => None,
-                    }
-                }
-            };
+            // Paused while the mouse is moving. The time limit keeps running, and the
+            // first click after the pause happens straight away.
+            if !is_still_enough(&cfg.still, &state.last_moved) {
+                thread::sleep(IDLE_POLL);
+                next_click = Instant::now();
+                continue;
+            }
 
-            match emit_err {
-                Some(e) => {
-                    *state.click_error.lock() = format!("Emit error: {e}");
-                    state.clicking.store(false, Ordering::Relaxed);
-                    ctx.request_repaint();
-                    // Click was not delivered; don't advance session_clicks.
+            if !wait_while_clicking(&state, next_click) {
+                continue;
+            }
+
+            let period = cfg.period_ms() * rng.jitter(cfg.jitter_fraction());
+            let hold = cfg.hold_for(period);
+            let keys = cfg.button.keys();
+
+            // Press, hold, release. The release is always sent, even if stopping, so a
+            // button can never be left stuck down.
+            let pressed_at = Instant::now();
+            let press = emit_buttons(&mut dev, keys, 1);
+            if hold > 0.0 {
+                precise_sleep_until(pressed_at + ms(hold));
+            }
+            let release = emit_buttons(&mut dev, keys, 0);
+
+            match press.and(release) {
+                Ok(()) => {
+                    state.session_clicks.fetch_add(1, SeqCst);
                 }
-                None => {
-                    session_clicks += 1;
+                Err(e) => {
+                    *state.click_error.lock() = format!("Emit error: {e}");
+                    state.clicking.store(false, SeqCst);
+                    ctx.request_repaint();
+                    continue;
                 }
             }
 
-            let sleep_ms = interval.lock().to_millis().max(1);
-            thread::sleep(Duration::from_millis(sleep_ms));
+            // Schedule against a fixed timeline so the rate doesn't drift slow. If we
+            // fell a whole period behind (system stall), restart the timeline instead
+            // of firing a burst of catch-up clicks.
+            next_click += ms(period);
+            let now = Instant::now();
+            if now > next_click + ms(period) {
+                next_click = now;
+            }
         }
     });
 }
@@ -416,90 +904,101 @@ fn spawn_clicker(
 
 struct App {
     state: Arc<SharedState>,
+    config: Arc<Mutex<Config>>,
+    hotkey: Arc<Mutex<Hotkey>>,
 
-    interval:        Arc<Mutex<Setting>>,
-    click_duration:  Arc<Mutex<Setting>>,
-    still_threshold: Arc<Mutex<Setting>>,
-    button: Arc<Mutex<ClickButton>>,
-    hotkey: Arc<Mutex<Vec<Key>>>,
-
-    ui_interval:       Setting,
-    ui_click_duration: Setting,
-    ui_still:          Setting,
-    ui_button:         ClickButton,
-    hotkey_display:    String,
-    prev_capturing:    bool,
-    keyboard_count:    usize,
+    ui_cfg: Config,
+    hotkey_display: String,
+    prev_capturing: bool,
+    dirty_since: Option<Instant>,
+    save_error: Option<String>,
 }
 
 impl App {
     fn new(
         state: Arc<SharedState>,
-        interval: Arc<Mutex<Setting>>,
-        click_duration: Arc<Mutex<Setting>>,
-        still_threshold: Arc<Mutex<Setting>>,
-        button: Arc<Mutex<ClickButton>>,
-        hotkey: Arc<Mutex<Vec<Key>>>,
-        keyboard_count: usize,
+        config: Arc<Mutex<Config>>,
+        hotkey: Arc<Mutex<Hotkey>>,
     ) -> Self {
-        let ui_interval       = interval.lock().clone();
-        let ui_click_duration = click_duration.lock().clone();
-        let ui_still          = still_threshold.lock().clone();
-        let ui_button         = *button.lock();
-        let hotkey_display    = hotkey_label(&hotkey.lock());
+        let ui_cfg = config.lock().clone();
+        let hotkey_display = hotkey_label(&hotkey.lock().keys);
         Self {
             state,
-            interval,
-            click_duration,
-            still_threshold,
-            button,
+            config,
             hotkey,
-            ui_interval,
-            ui_click_duration,
-            ui_still,
-            ui_button,
+            ui_cfg,
             hotkey_display,
             prev_capturing: false,
-            keyboard_count,
+            dirty_since: None,
+            save_error: None,
         }
+    }
+
+    fn mark_dirty(&mut self) {
+        self.dirty_since = Some(Instant::now());
+    }
+
+    fn save_now(&mut self) {
+        let hotkey = self.hotkey.lock().clone();
+        self.save_error = save_config(&self.ui_cfg, &hotkey)
+            .err()
+            .map(|e| format!("Couldn't save settings: {e}"));
+        self.dirty_since = None;
     }
 }
 
 fn key_order(k: Key) -> (u8, u16) {
     let priority = match k {
-        Key::KEY_LEFTMETA  | Key::KEY_RIGHTMETA  => 0, // super
-        Key::KEY_LEFTCTRL  | Key::KEY_RIGHTCTRL  => 1, // ctrl
-        Key::KEY_LEFTALT   | Key::KEY_RIGHTALT   => 2, // alt
+        Key::KEY_LEFTMETA | Key::KEY_RIGHTMETA => 0,   // super
+        Key::KEY_LEFTCTRL | Key::KEY_RIGHTCTRL => 1,   // ctrl
+        Key::KEY_LEFTALT | Key::KEY_RIGHTALT => 2,     // alt
         Key::KEY_LEFTSHIFT | Key::KEY_RIGHTSHIFT => 3, // shift
-        Key::KEY_FN                              => 4, // fn
-        _                                        => 5, // everything else
+        Key::KEY_FN => 4,                              // fn
+        _ => 5,                                        // everything else
     };
     (priority, k.code())
 }
 
-fn hotkey_label(keys: &[Key]) -> String {
-    if keys.is_empty() { return "None".to_string(); }
-    let mut out = String::new();
-    for (i, k) in keys.iter().enumerate() {
-        if i > 0 { out.push('+'); }
-        let s = format!("{k:?}");
-        out.push_str(s.strip_prefix("KEY_").unwrap_or(&s));
+fn key_name(k: Key) -> String {
+    match k {
+        Key::BTN_MIDDLE => "MouseMiddle".to_string(),
+        Key::BTN_SIDE => "Mouse4".to_string(),
+        Key::BTN_EXTRA => "Mouse5".to_string(),
+        Key::BTN_FORWARD => "MouseForward".to_string(),
+        Key::BTN_BACK => "MouseBack".to_string(),
+        _ => {
+            let s = format!("{k:?}");
+            s.strip_prefix("KEY_").unwrap_or(&s).to_string()
+        }
     }
-    out
+}
+
+fn hotkey_label(keys: &[Key]) -> String {
+    if keys.is_empty() {
+        return "None".to_string();
+    }
+    keys.iter()
+        .map(|k| key_name(*k))
+        .collect::<Vec<_>>()
+        .join("+")
 }
 
 fn setting_field(ui: &mut egui::Ui, id: &str, setting: &mut Setting, units: &[Unit]) -> bool {
     let mut changed = false;
     ui.horizontal(|ui| {
-        let h      = ui.spacing().interact_size.y;
-        let gap    = ui.spacing().item_spacing.x;
-        let unit_w = 58.0;
-        let val_w  = ui.available_width() - unit_w - gap;
+        let h = ui.spacing().interact_size.y;
+        let gap = ui.spacing().item_spacing.x;
+        let unit_w = 72.0;
+        let val_w = ui.available_width() - unit_w - gap;
 
+        let range = setting.unit.range();
+        let speed = (setting.value.abs() * 0.01).max(0.01);
         let r = ui.add_sized(
             [val_w, h],
             egui::DragValue::new(&mut setting.value)
-                .clamp_range(setting.range.clone()),
+                .clamp_range(range.clone())
+                .speed(speed)
+                .max_decimals(setting.unit.decimals()),
         );
         changed |= r.changed();
         if r.hovered() {
@@ -508,44 +1007,54 @@ fn setting_field(ui: &mut egui::Ui, id: &str, setting: &mut Setting, units: &[Un
                 i.raw_scroll_delta.y = 0.0;
                 dy
             });
-            let (&min, &max) = (setting.range.start(), setting.range.end());
-            if scroll > 0.0 { setting.value = setting.value.saturating_add(1).min(max); changed = true; }
-            if scroll < 0.0 { setting.value = setting.value.saturating_sub(1).max(min); changed = true; }
+            let step = if setting.value >= 2.0 || setting.unit.decimals() == 0 {
+                1.0
+            } else {
+                0.1
+            };
+            if scroll > 0.0 {
+                setting.value = (setting.value + step).min(*range.end());
+                changed = true;
+            }
+            if scroll < 0.0 {
+                setting.value = (setting.value - step).max(*range.start());
+                changed = true;
+            }
         }
 
+        let mut unit = setting.unit;
         egui::ComboBox::from_id_source(id)
-            .selected_text(setting.unit.label())
+            .selected_text(unit.label())
             .width(unit_w - gap)
             .show_ui(ui, |ui| {
-                for &unit in units {
-                    if ui.selectable_value(&mut setting.unit, unit, unit.label()).changed() {
-                        changed = true;
-                    }
+                for &u in units {
+                    ui.selectable_value(&mut unit, u, u.label());
                 }
             });
+        if unit != setting.unit {
+            setting.change_unit(unit);
+            changed = true;
+        }
     });
     changed
 }
 
+fn hint(ui: &mut egui::Ui, text: impl Into<String>) {
+    ui.label(egui::RichText::new(text.into()).small().weak());
+}
+
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Scale the UI to fill the window width. Height handled by ScrollArea.
-        {
-            let ppp    = ctx.pixels_per_point();
-            let phys_w = ctx.input(|i| i.screen_rect().width()) * ppp;
-            let new_ppp = (phys_w / UI_WIDTH).clamp(0.5, 4.0);
-            if (new_ppp - ppp).abs() > 0.001 {
-                ctx.set_pixels_per_point(new_ppp);
-            }
-        }
-
-        let capturing = self.state.capturing.load(Ordering::Relaxed);
+        let capturing = self.state.capturing.load(SeqCst);
         if self.prev_capturing && !capturing {
-            self.hotkey_display = hotkey_label(&self.hotkey.lock());
+            self.hotkey_display = hotkey_label(&self.hotkey.lock().keys);
+            self.mark_dirty();
         }
         self.prev_capturing = capturing;
 
-        let clicking = self.state.clicking.load(Ordering::Relaxed);
+        let clicking = self.state.clicking.load(SeqCst);
+        let mut changed = false;
+        let mut hotkey_changed = false;
 
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::ScrollArea::vertical()
@@ -557,84 +1066,141 @@ impl eframe::App for App {
                         ui.heading(APP_TITLE);
                         ui.add_space(6.0);
 
-                        let (status_text, status_color) = if clicking {
-                            ("● Active", egui::Color32::from_rgb(100, 220, 100))
+                        if clicking {
+                            let n = self.state.session_clicks.load(SeqCst);
+                            ui.colored_label(
+                                egui::Color32::from_rgb(100, 220, 100),
+                                format!("● Active · {n} clicks"),
+                            );
                         } else {
-                            ("○ Stopped", egui::Color32::from_rgb(160, 160, 160))
-                        };
-                        ui.colored_label(status_color, status_text);
+                            ui.colored_label(egui::Color32::from_rgb(160, 160, 160), "○ Stopped");
+                        }
 
                         ui.add_space(6.0);
                         ui.separator();
                         ui.add_space(6.0);
 
-                        // Button selector — three equal-width segments.
+                        // Button selector — equal-width segments.
                         ui.label("Button");
                         ui.horizontal(|ui| {
+                            let n = ClickButton::ALL.len() as f32;
                             let gap = ui.spacing().item_spacing.x;
-                            let w = (ui.available_width() - gap * 2.0) / 3.0;
-                            for variant in [ClickButton::Left, ClickButton::Right, ClickButton::Both] {
-                                let selected = self.ui_button == variant;
+                            let w = (ui.available_width() - gap * (n - 1.0)) / n;
+                            for variant in ClickButton::ALL {
+                                let selected = self.ui_cfg.button == variant;
                                 if ui
-                                    .add_sized([w, h], egui::SelectableLabel::new(selected, variant.label()))
+                                    .add_sized(
+                                        [w, h],
+                                        egui::SelectableLabel::new(selected, variant.label()),
+                                    )
                                     .clicked()
+                                    && !selected
                                 {
-                                    self.ui_button = variant;
-                                    *self.button.lock() = variant;
+                                    self.ui_cfg.button = variant;
+                                    changed = true;
                                 }
                             }
                         });
 
                         ui.add_space(6.0);
 
-                        // Click interval.
-                        ui.label("Click interval");
-                        if setting_field(ui, "interval", &mut self.ui_interval, TIME_UNITS) {
-                            *self.interval.lock() = self.ui_interval.clone();
+                        // Click rate.
+                        ui.label("Click rate");
+                        changed |= setting_field(ui, "rate", &mut self.ui_cfg.rate, RATE_UNITS);
+                        let period = self.ui_cfg.period_ms();
+                        if self.ui_cfg.rate.unit == Unit::Cps {
+                            hint(ui, format!("one click every {period:.1} ms"));
+                        } else {
+                            hint(ui, format!("{:.2} clicks per second", 1000.0 / period));
                         }
 
                         ui.add_space(6.0);
 
-                        // Clicking duration (time or clicks).
-                        if ui.checkbox(&mut self.ui_click_duration.enabled, "Clicking duration").changed() {
-                            *self.click_duration.lock() = self.ui_click_duration.clone();
+                        // Hold time.
+                        ui.label("Hold each click for");
+                        let r = ui.add_sized(
+                            [ui.available_width(), h],
+                            egui::DragValue::new(&mut self.ui_cfg.hold_ms)
+                                .clamp_range(0.0..=1000.0)
+                                .speed(0.25)
+                                .max_decimals(1)
+                                .suffix(" ms"),
+                        );
+                        changed |= r.changed();
+                        let effective = self.ui_cfg.hold_for(period);
+                        if self.ui_cfg.hold_ms <= 0.0 {
+                            hint(ui, "instant press and release — some games miss these");
+                        } else if effective < self.ui_cfg.hold_ms {
+                            hint(
+                                ui,
+                                format!("capped to {effective:.1} ms (half the interval)"),
+                            );
                         }
-                        if self.ui_click_duration.enabled {
-                            if setting_field(ui, "click_duration", &mut self.ui_click_duration, ALL_UNITS) {
-                                *self.click_duration.lock() = self.ui_click_duration.clone();
-                            }
+
+                        ui.add_space(6.0);
+
+                        // Randomized timing.
+                        changed |= ui
+                            .checkbox(&mut self.ui_cfg.jitter_enabled, "Randomize timing")
+                            .changed();
+                        if self.ui_cfg.jitter_enabled {
+                            changed |= ui
+                                .add(
+                                    egui::Slider::new(&mut self.ui_cfg.jitter_pct, 1.0..=50.0)
+                                        .suffix("%"),
+                                )
+                                .changed();
+                            hint(ui, "each interval varies by up to ± this much");
+                        }
+
+                        ui.add_space(6.0);
+
+                        // Auto-stop after a time or click count.
+                        changed |= ui
+                            .checkbox(&mut self.ui_cfg.limit.enabled, "Stop after")
+                            .changed();
+                        if self.ui_cfg.limit.enabled {
+                            changed |=
+                                setting_field(ui, "limit", &mut self.ui_cfg.limit, LIMIT_UNITS);
                         }
 
                         ui.add_space(6.0);
 
                         // Still threshold.
-                        if ui.checkbox(&mut self.ui_still.enabled, "Still threshold").changed() {
-                            *self.still_threshold.lock() = self.ui_still.clone();
-                        }
-                        if self.ui_still.enabled {
-                            if setting_field(ui, "still_threshold", &mut self.ui_still, TIME_UNITS) {
-                                *self.still_threshold.lock() = self.ui_still.clone();
-                            }
+                        changed |= ui
+                            .checkbox(
+                                &mut self.ui_cfg.still.enabled,
+                                "Only click when mouse is still for",
+                            )
+                            .changed();
+                        if self.ui_cfg.still.enabled {
+                            changed |=
+                                setting_field(ui, "still", &mut self.ui_cfg.still, TIME_UNITS);
                         }
 
                         ui.add_space(6.0);
                         ui.separator();
                         ui.add_space(6.0);
 
-                        // Hotkey capture — full-width button.
-                        ui.label("Toggle hotkey (global)");
-                        if self.keyboard_count == 0 {
+                        // Hotkey.
+                        ui.label("Hotkey (global)");
+                        if self.state.scanned_once.load(SeqCst)
+                            && self.state.device_count.load(SeqCst) == 0
+                        {
                             ui.colored_label(
                                 egui::Color32::from_rgb(220, 200, 80),
-                                "No keyboard devices found",
+                                "Can't read any input devices — are you in the 'input' group?",
                             );
                         }
                         if capturing {
                             if ui
-                                .add_sized([ui.available_width(), h], egui::Button::new("Press any key(s)…"))
+                                .add_sized(
+                                    [ui.available_width(), h],
+                                    egui::Button::new("Press key(s)… (Esc to cancel)"),
+                                )
                                 .clicked()
                             {
-                                self.state.capturing.store(false, Ordering::Relaxed);
+                                self.state.capturing.store(false, SeqCst);
                             }
                         } else {
                             let label = format!("[{}]", self.hotkey_display);
@@ -642,28 +1208,50 @@ impl eframe::App for App {
                                 .add_sized([ui.available_width(), h], egui::Button::new(label))
                                 .clicked()
                             {
-                                self.state.capturing.store(true, Ordering::Relaxed);
+                                self.state.capturing.store(true, SeqCst);
                             }
                         }
 
+                        ui.horizontal(|ui| {
+                            let gap = ui.spacing().item_spacing.x;
+                            let w = (ui.available_width() - gap) / 2.0;
+                            let current = self.hotkey.lock().mode;
+                            for (mode, label) in [
+                                (HotkeyMode::Toggle, "Press to toggle"),
+                                (HotkeyMode::Hold, "Hold to click"),
+                            ] {
+                                if ui
+                                    .add_sized(
+                                        [w, h],
+                                        egui::SelectableLabel::new(current == mode, label),
+                                    )
+                                    .clicked()
+                                    && current != mode
+                                {
+                                    self.hotkey.lock().mode = mode;
+                                    hotkey_changed = true;
+                                }
+                            }
+                        });
+
                         ui.add_space(8.0);
 
-                        // Manual start/stop — full-width button.
+                        // Manual start/stop.
                         let toggle_label = if clicking { "Stop" } else { "Start" };
                         if ui
-                            .add_sized([ui.available_width(), h * 1.5], egui::Button::new(toggle_label))
+                            .add_sized(
+                                [ui.available_width(), h * 1.5],
+                                egui::Button::new(toggle_label),
+                            )
                             .clicked()
                         {
                             if !clicking {
-                                self.state.delayed_start.store(true, Ordering::Relaxed);
+                                self.state.delayed_start.store(true, SeqCst);
                             }
-                            // CAS avoids overwriting a concurrent state change from the clicker
-                            // thread (e.g. duration-stop racing with manual stop). Release
-                            // ordering ensures `delayed_start = true` is visible to the clicker's
-                            // Acquire load of `clicking`.
-                            let _ = self.state.clicking.compare_exchange(
-                                clicking, !clicking, Ordering::Release, Ordering::Relaxed,
-                            );
+                            let _ = self
+                                .state
+                                .clicking
+                                .compare_exchange(clicking, !clicking, SeqCst, SeqCst);
                         }
 
                         let err = self.state.click_error.lock().clone();
@@ -671,13 +1259,38 @@ impl eframe::App for App {
                             ui.add_space(4.0);
                             ui.colored_label(egui::Color32::from_rgb(220, 80, 80), &err);
                         }
+                        if let Some(err) = &self.save_error {
+                            ui.add_space(4.0);
+                            ui.colored_label(egui::Color32::from_rgb(220, 80, 80), err);
+                        }
                     });
                 });
         });
+
+        if changed {
+            *self.config.lock() = self.ui_cfg.clone();
+        }
+        if changed || hotkey_changed {
+            self.mark_dirty();
+        }
+        if let Some(since) = self.dirty_since {
+            if since.elapsed() >= SAVE_DELAY {
+                self.save_now();
+            } else {
+                ctx.request_repaint_after(SAVE_DELAY);
+            }
+        }
+        if clicking {
+            // Keep the click counter ticking.
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        self.state.shutdown.store(true, Ordering::Release);
+        self.state.shutdown.store(true, SeqCst);
+        if self.dirty_since.is_some() {
+            self.save_now();
+        }
     }
 }
 
@@ -686,14 +1299,14 @@ mod tests {
     use super::*;
     use evdev::Key;
 
-    // hotkey_label relies on evdev's Debug format ("KEY_*"). Pin it here so any
+    // key_name relies on evdev's Debug format ("KEY_*"). Pin it here so any
     // upstream change that would silently break labels is caught immediately.
     #[test]
     fn evdev_key_debug_format_for_hotkey_label() {
-        assert_eq!(format!("{:?}", Key::KEY_A),        "KEY_A");
-        assert_eq!(format!("{:?}", Key::KEY_F8),       "KEY_F8");
+        assert_eq!(format!("{:?}", Key::KEY_A), "KEY_A");
+        assert_eq!(format!("{:?}", Key::KEY_F8), "KEY_F8");
         assert_eq!(format!("{:?}", Key::KEY_LEFTCTRL), "KEY_LEFTCTRL");
-        assert_eq!(format!("{:?}", Key::BTN_LEFT),     "BTN_LEFT"); // no KEY_ prefix — passes through as-is
+        assert_eq!(format!("{:?}", Key::BTN_LEFT), "BTN_LEFT"); // no KEY_ prefix — passes through as-is
     }
 
     #[test]
@@ -706,22 +1319,108 @@ mod tests {
         let combo = vec![Key::KEY_LEFTCTRL, Key::KEY_A];
         assert_eq!(hotkey_label(&combo), "LEFTCTRL+A");
     }
+
+    #[test]
+    fn hotkey_label_names_mouse_buttons() {
+        assert_eq!(hotkey_label(&[Key::BTN_SIDE]), "Mouse4");
+        assert_eq!(
+            hotkey_label(&[Key::KEY_LEFTSHIFT, Key::BTN_EXTRA]),
+            "LEFTSHIFT+Mouse5"
+        );
+    }
+
+    #[test]
+    fn hotkey_eligibility() {
+        assert!(hotkey_eligible(Key::KEY_A));
+        assert!(hotkey_eligible(Key::KEY_F8));
+        assert!(hotkey_eligible(Key::BTN_SIDE));
+        assert!(hotkey_eligible(Key::BTN_MIDDLE));
+        assert!(!hotkey_eligible(Key::BTN_LEFT));
+        assert!(!hotkey_eligible(Key::BTN_RIGHT));
+        assert!(!hotkey_eligible(Key::BTN_TOUCH));
+        assert!(!hotkey_eligible(Key::BTN_TOOL_FINGER));
+    }
+
+    #[test]
+    fn unit_change_keeps_rate() {
+        let mut s = Setting::new(true, 20.0, Unit::Cps);
+        s.change_unit(Unit::Ms);
+        assert!((s.value - 50.0).abs() < 1e-9);
+        s.change_unit(Unit::Sec);
+        assert!((s.value - 0.05).abs() < 1e-9);
+        s.change_unit(Unit::Cps);
+        assert!((s.value - 20.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn unit_change_to_clicks_keeps_value() {
+        let mut s = Setting::new(true, 5.0, Unit::Min);
+        s.change_unit(Unit::Clicks);
+        assert_eq!(s.value, 5.0);
+        assert_eq!(s.unit, Unit::Clicks);
+    }
+
+    #[test]
+    fn hold_is_capped_to_half_the_period() {
+        let c = Config {
+            hold_ms: 30.0,
+            ..Config::default()
+        };
+        assert_eq!(c.hold_for(100.0), 30.0);
+        assert_eq!(c.hold_for(20.0), 10.0);
+    }
+
+    #[test]
+    fn jitter_stays_in_bounds() {
+        let mut rng = Rng::seeded();
+        for _ in 0..10_000 {
+            let j = rng.jitter(0.2);
+            assert!((0.8..=1.2).contains(&j));
+        }
+        assert_eq!(rng.jitter(0.0), 1.0);
+    }
+
+    #[test]
+    fn config_round_trips() {
+        let c = Config {
+            button: ClickButton::Middle,
+            rate: Setting::new(true, 66.67, Unit::Ms),
+            hold_ms: 12.5,
+            jitter_enabled: true,
+            jitter_pct: 15.0,
+            limit: Setting::new(true, 500.0, Unit::Clicks),
+            still: Setting::new(true, 0.25, Unit::Sec),
+        };
+        let h = Hotkey {
+            keys: vec![Key::KEY_LEFTCTRL, Key::BTN_SIDE],
+            mode: HotkeyMode::Hold,
+        };
+        let (c2, h2) = parse_config(&serialize_config(&c, &h));
+        assert_eq!(c, c2);
+        assert_eq!(h, h2);
+    }
+
+    #[test]
+    fn bad_config_falls_back_to_defaults() {
+        let (c, h) = parse_config("rate=banana\nbutton=nope\nhotkey=x,y\nrate_unit=clicks\n");
+        assert_eq!(c, Config::default());
+        assert_eq!(h, Hotkey::default());
+    }
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 fn main() -> eframe::Result<()> {
+    let (config, hotkey) = load_config();
     let state = SharedState::new();
-    let interval        = Arc::new(Mutex::new(Setting::new(true,  100, Unit::Ms,  1..=999_999)));
-    let click_duration  = Arc::new(Mutex::new(Setting::new(false,   1, Unit::Min, 1..=999_999)));
-    let still_threshold = Arc::new(Mutex::new(Setting::new(false,   1, Unit::Sec, 1..=999_999)));
-    let button = Arc::new(Mutex::new(ClickButton::Left));
-    let hotkey: Arc<Mutex<Vec<Key>>> = Arc::new(Mutex::new(vec![Key::KEY_F8]));
+    let config = Arc::new(Mutex::new(config));
+    let hotkey = Arc::new(Mutex::new(hotkey));
 
     let mut opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(APP_TITLE)
-            .with_inner_size([UI_WIDTH, 300.0]),
+            .with_inner_size([300.0, 560.0])
+            .with_min_inner_size([260.0, 300.0]),
         renderer: eframe::Renderer::Wgpu,
         ..Default::default()
     };
@@ -739,22 +1438,9 @@ fn main() -> eframe::Result<()> {
         opts,
         Box::new(|cc| {
             let ctx = cc.egui_ctx.clone();
-            spawn_mouse_watchers(Arc::clone(&state), ctx.clone());
-            let keyboard_count = spawn_hotkey_watcher(
-                Arc::clone(&state), Arc::clone(&hotkey), ctx.clone(),
-            );
-            spawn_clicker(
-                Arc::clone(&state),
-                Arc::clone(&interval),
-                Arc::clone(&click_duration),
-                Arc::clone(&still_threshold),
-                Arc::clone(&button),
-                ctx,
-            );
-            Box::new(App::new(
-                state, interval, click_duration, still_threshold, button, hotkey,
-                keyboard_count,
-            ))
+            spawn_device_scanner(Arc::clone(&state), Arc::clone(&hotkey), ctx.clone());
+            spawn_clicker(Arc::clone(&state), Arc::clone(&config), ctx);
+            Box::new(App::new(state, config, hotkey))
         }),
     )
 }
