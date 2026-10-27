@@ -57,7 +57,29 @@
           inherit src;
           cargoLock.lockFile = ./Cargo.lock;
 
-          nativeBuildInputs = [ pkgs.makeWrapper ];
+          nativeBuildInputs = [
+            pkgs.makeWrapper
+            pkgs.copyDesktopItems
+          ];
+
+          # eframe uses the app name as the Wayland app_id / X11 WM_CLASS, so naming
+          # the desktop file after it lets compositors match the window to the entry.
+          desktopItems = [
+            (pkgs.makeDesktopItem {
+              name = cargoToml.package.name;
+              desktopName = cargoToml.package.name;
+              comment = cargoToml.package.description;
+              exec = cargoToml.package.name;
+              icon = "input-mouse";
+              startupWMClass = cargoToml.package.name;
+              categories = [ "Utility" ];
+              keywords = [
+                "click"
+                "mouse"
+                "automation"
+              ];
+            })
+          ];
 
           postFixup = ''
             wrapProgram $out/bin/${cargoToml.package.name} \
